@@ -6,6 +6,13 @@ import { visit, namedTypes as n, builders as b } from 'ast-types';
 export type DegeneratorName = string | RegExp;
 export type DegeneratorNames = DegeneratorName[];
 
+// Caching infrastructure for performance optimization
+// Per-invocation caches to avoid Jest serialization issues
+interface CacheContext {
+	astCache: WeakMap<object, boolean>;
+	codeGenerationCache: WeakMap<object, string>;
+}
+
 /**
  * Compiles sync JavaScript code into JavaScript with async Functions.
  *
@@ -22,6 +29,12 @@ export function degenerator(code: string, _names: DegeneratorNames): string {
 
 	// Duplicate the `names` array since it's rude to augment the user args
 	const names = _names.slice(0);
+
+	// Create per-invocation cache context
+	const cacheCtx: CacheContext = {
+		astCache: new WeakMap(),
+		codeGenerationCache: new WeakMap(),
+	};
 
 	const ast = parseScript(code);
 
@@ -64,6 +77,20 @@ export function degenerator(code: string, _names: DegeneratorNames): string {
 			},
 			visitFunction(path) {
 				if (path.node.id) {
+					// Fast path: skip if already async
+					if (isAlreadyAsync(path.node)) {
+						return false;
+					}
+
+					// Check cache to avoid redundant AST walking
+					if (cacheCtx.astCache.has(path.node)) {
+						const shouldDegenerate = cacheCtx.astCache.get(path.node);
+						if (shouldDegenerate && !checkName(path.node.id.name, names)) {
+							names.push(path.node.id.name);
+						}
+						return false;
+					}
+
 					let shouldDegenerate = false;
 					visit(path.node, {
 						visitCallExpression(path) {
@@ -73,6 +100,9 @@ export function degenerator(code: string, _names: DegeneratorNames): string {
 							return false;
 						},
 					});
+
+					// Cache the result
+					cacheCtx.astCache.set(path.node, shouldDegenerate);
 
 					if (!shouldDegenerate) {
 						return false;
@@ -119,7 +149,16 @@ export function degenerator(code: string, _names: DegeneratorNames): string {
 		},
 	});
 
-	return generate(ast);
+	// Check code generation cache
+	const cached = cacheCtx.codeGenerationCache.get(ast);
+	if (cached) {
+		return cached;
+	}
+
+	// Generate code and cache it
+	const generated = generate(ast);
+	cacheCtx.codeGenerationCache.set(ast, generated);
+	return generated;
 }
 
 /**
@@ -173,4 +212,11 @@ function checkName(name: string, names: DegeneratorNames): boolean {
 		}
 	}
 	return false;
+}
+
+/**
+ * Fast path check: returns true if function is already async
+ */
+function isAlreadyAsync(node: any): boolean {
+	return node.async === true || node.generator === true;
 }
