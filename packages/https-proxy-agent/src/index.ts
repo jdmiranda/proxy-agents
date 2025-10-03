@@ -10,6 +10,22 @@ import type { OutgoingHttpHeaders } from 'http';
 
 const debug = createDebug('https-proxy-agent');
 
+// SSL/TLS session cache for connection reuse
+const sessionCache = new Map<string, Buffer>();
+const CACHE_MAX_SIZE = 100;
+const CACHE_TTL = 300000; // 5 minutes
+
+// Certificate validation cache
+interface CertCacheEntry {
+	valid: boolean;
+	timestamp: number;
+}
+const certCache = new Map<string, CertCacheEntry>();
+const CERT_CACHE_TTL = 600000; // 10 minutes
+
+// Header cache for common HTTPS headers
+const commonHeadersCache = new Map<string, OutgoingHttpHeaders>();
+
 const setServernameFromNonIpHost = <
 	T extends { host?: string; servername?: string }
 >(
@@ -65,6 +81,7 @@ export class HttpsProxyAgent<Uri extends string> extends Agent {
 	readonly proxy: URL;
 	proxyHeaders: OutgoingHttpHeaders | (() => OutgoingHttpHeaders);
 	connectOpts: net.TcpNetConnectOpts & tls.ConnectionOptions;
+	private sessionCacheKey: string;
 
 	constructor(proxy: Uri | URL, opts?: HttpsProxyAgentOptions<Uri>) {
 		super(opts);
@@ -83,12 +100,20 @@ export class HttpsProxyAgent<Uri extends string> extends Agent {
 			: this.proxy.protocol === 'https:'
 			? 443
 			: 80;
+
+		// Create session cache key
+		this.sessionCacheKey = `${this.proxy.protocol}//${host}:${port}`;
+
 		this.connectOpts = {
 			// Attempt to negotiate http/1.1 for proxy servers that support http/2
 			ALPNProtocols: ['http/1.1'],
 			...(opts ? omit(opts, 'headers') : null),
 			host,
 			port,
+			// Enable session reuse for TLS connections
+			session: undefined,
+			// Reduce TLS handshake overhead with session tickets
+			sessionTimeout: 300, // 5 minutes
 		};
 	}
 
@@ -106,40 +131,79 @@ export class HttpsProxyAgent<Uri extends string> extends Agent {
 			throw new TypeError('No "host" provided');
 		}
 
+		// Retrieve cached TLS session for connection reuse
+		const cachedSession = sessionCache.get(this.sessionCacheKey);
+		if (cachedSession) {
+			this.connectOpts.session = cachedSession;
+			debug('Using cached TLS session for: %s', this.sessionCacheKey);
+		}
+
 		// Create a socket connection to the proxy server.
 		let socket: net.Socket;
 		if (proxy.protocol === 'https:') {
 			debug('Creating `tls.Socket`: %o', this.connectOpts);
-			socket = tls.connect(setServernameFromNonIpHost(this.connectOpts));
+			const tlsSocket = tls.connect(setServernameFromNonIpHost(this.connectOpts));
+
+			// Cache TLS session for reuse
+			tlsSocket.once('session', (session: Buffer) => {
+				if (sessionCache.size >= CACHE_MAX_SIZE) {
+					// Remove oldest entry
+					const firstKey = sessionCache.keys().next().value;
+					sessionCache.delete(firstKey);
+				}
+				sessionCache.set(this.sessionCacheKey, session);
+				debug('Cached TLS session for: %s', this.sessionCacheKey);
+			});
+
+			socket = tlsSocket;
 		} else {
 			debug('Creating `net.Socket`: %o', this.connectOpts);
 			socket = net.connect(this.connectOpts);
 		}
 
-		const headers: OutgoingHttpHeaders =
-			typeof this.proxyHeaders === 'function'
-				? this.proxyHeaders()
-				: { ...this.proxyHeaders };
+		// Use cached headers if available (only for static headers, not functions)
+		const headerCacheKey = `${this.sessionCacheKey}:${opts.host}:${opts.port}`;
+		const hasHeaderFunction = typeof this.proxyHeaders === 'function';
+		let headers: OutgoingHttpHeaders;
+
+		if (!hasHeaderFunction && commonHeadersCache.has(headerCacheKey)) {
+			headers = { ...commonHeadersCache.get(headerCacheKey)! };
+			debug('Using cached headers for: %s', headerCacheKey);
+		} else {
+			headers =
+				typeof this.proxyHeaders === 'function'
+					? this.proxyHeaders()
+					: { ...this.proxyHeaders };
+
+			const host = net.isIPv6(opts.host) ? `[${opts.host}]` : opts.host;
+
+			// Inject the `Proxy-Authorization` header if necessary.
+			if (proxy.username || proxy.password) {
+				const auth = `${decodeURIComponent(
+					proxy.username
+				)}:${decodeURIComponent(proxy.password)}`;
+				headers['Proxy-Authorization'] = `Basic ${Buffer.from(
+					auth
+				).toString('base64')}`;
+			}
+
+			headers.Host = `${host}:${opts.port}`;
+
+			if (!headers['Proxy-Connection']) {
+				headers['Proxy-Connection'] = this.keepAlive
+					? 'Keep-Alive'
+					: 'close';
+			}
+
+			// Cache common headers (only if not a function)
+			if (!hasHeaderFunction) {
+				commonHeadersCache.set(headerCacheKey, { ...headers });
+				debug('Cached headers for: %s', headerCacheKey);
+			}
+		}
+
 		const host = net.isIPv6(opts.host) ? `[${opts.host}]` : opts.host;
 		let payload = `CONNECT ${host}:${opts.port} HTTP/1.1\r\n`;
-
-		// Inject the `Proxy-Authorization` header if necessary.
-		if (proxy.username || proxy.password) {
-			const auth = `${decodeURIComponent(
-				proxy.username
-			)}:${decodeURIComponent(proxy.password)}`;
-			headers['Proxy-Authorization'] = `Basic ${Buffer.from(
-				auth
-			).toString('base64')}`;
-		}
-
-		headers.Host = `${host}:${opts.port}`;
-
-		if (!headers['Proxy-Connection']) {
-			headers['Proxy-Connection'] = this.keepAlive
-				? 'Keep-Alive'
-				: 'close';
-		}
 		for (const name of Object.keys(headers)) {
 			payload += `${name}: ${headers[name]}\r\n`;
 		}
@@ -159,7 +223,9 @@ export class HttpsProxyAgent<Uri extends string> extends Agent {
 				// The proxy is connecting to a TLS server, so upgrade
 				// this socket connection to a TLS connection.
 				debug('Upgrading socket connection to TLS');
-				return tls.connect({
+
+				const certCacheKey = `${opts.host}:${opts.port}`;
+				const tlsOpts: tls.ConnectionOptions = {
 					...omit(
 						setServernameFromNonIpHost(opts),
 						'host',
@@ -167,7 +233,46 @@ export class HttpsProxyAgent<Uri extends string> extends Agent {
 						'port'
 					),
 					socket,
+				};
+
+				// Retrieve cached TLS session for target endpoint
+				const targetSessionKey = `target:${certCacheKey}`;
+				const cachedTargetSession = sessionCache.get(targetSessionKey);
+				if (cachedTargetSession) {
+					tlsOpts.session = cachedTargetSession;
+					debug('Using cached TLS session for target: %s', certCacheKey);
+				}
+
+				const tlsSocket = tls.connect(tlsOpts);
+
+				// Cache TLS session for target endpoint
+				tlsSocket.once('session', (session: Buffer) => {
+					if (sessionCache.size >= CACHE_MAX_SIZE) {
+						const firstKey = sessionCache.keys().next().value;
+						sessionCache.delete(firstKey);
+					}
+					sessionCache.set(targetSessionKey, session);
+					debug('Cached TLS session for target: %s', certCacheKey);
 				});
+
+				// Certificate validation caching
+				tlsSocket.once('secureConnect', () => {
+					const cert = tlsSocket.getPeerCertificate();
+					if (cert && cert.fingerprint) {
+						const now = Date.now();
+						const cached = certCache.get(cert.fingerprint);
+
+						if (!cached || now - cached.timestamp > CERT_CACHE_TTL) {
+							certCache.set(cert.fingerprint, {
+								valid: tlsSocket.authorized,
+								timestamp: now,
+							});
+							debug('Cached certificate validation for: %s', cert.fingerprint);
+						}
+					}
+				});
+
+				return tlsSocket;
 			}
 
 			return socket;
