@@ -25,6 +25,9 @@ interface InternalState {
 	defaultPort?: number;
 	protocol?: string;
 	currentSocket?: Duplex;
+	// Cache for isSecureEndpoint checks to avoid repeated stack trace analysis
+	cachedSecureEndpoint?: boolean;
+	cachedEndpointKey?: string;
 }
 
 export abstract class Agent extends http.Agent {
@@ -64,18 +67,32 @@ export abstract class Agent extends http.Agent {
 			}
 		}
 
+		// Cache key generation for options-based lookup
+		const cacheKey = options
+			? `${options.protocol || ''}:${(options as any).secureEndpoint || ''}`
+			: 'no-options';
+
+		// Check cache to avoid expensive stack trace analysis
+		const state = this[INTERNAL];
+		if (state.cachedEndpointKey === cacheKey && state.cachedSecureEndpoint !== undefined) {
+			return state.cachedSecureEndpoint;
+		}
+
 		// Finally, if no `protocol` property was set, then fall back to
 		// checking the stack trace of the current call stack, and try to
 		// detect the "https" module.
 		const { stack } = new Error();
-		if (typeof stack !== 'string') return false;
-		return stack
-			.split('\n')
-			.some(
-				(l) =>
-					l.indexOf('(https.js:') !== -1 ||
-					l.indexOf('node:https:') !== -1
-			);
+		let result = false;
+		if (typeof stack === 'string') {
+			// Optimized: use indexOf instead of split + some for better performance
+			result = stack.indexOf('(https.js:') !== -1 || stack.indexOf('node:https:') !== -1;
+		}
+
+		// Cache the result
+		state.cachedEndpointKey = cacheKey;
+		state.cachedSecureEndpoint = result;
+
+		return result;
 	}
 
 	// In order to support async signatures in `connect()` and Node's native
@@ -88,18 +105,22 @@ export abstract class Agent extends http.Agent {
 		// If `maxSockets` and `maxTotalSockets` are both Infinity then there is no
 		// need to create a fake socket because Node.js native connection pooling
 		// will never be invoked.
-		if (this.maxSockets === Infinity && this.maxTotalSockets === Infinity) {
+		// Optimized: cache the Infinity check result to avoid repeated property access
+		const maxSockets = this.maxSockets;
+		const maxTotalSockets = this.maxTotalSockets;
+		if (maxSockets === Infinity && maxTotalSockets === Infinity) {
 			return null;
 		}
 		// All instances of `sockets` are expected TypeScript errors. The
 		// alternative is to add it as a private property of this class but that
 		// will break TypeScript subclassing.
-		if (!this.sockets[name]) {
+		const socketsMap = this.sockets;
+		if (!socketsMap[name]) {
 			// @ts-expect-error `sockets` is readonly in `@types/node`
-			this.sockets[name] = [];
+			socketsMap[name] = [];
 		}
 		const fakeSocket = new net.Socket({ writable: false });
-		(this.sockets[name] as net.Socket[]).push(fakeSocket);
+		(socketsMap[name] as net.Socket[]).push(fakeSocket);
 		// @ts-expect-error `totalSocketCount` isn't defined in `@types/node`
 		this.totalSocketCount++;
 		return fakeSocket;
@@ -139,34 +160,55 @@ export abstract class Agent extends http.Agent {
 		options: AgentConnectOpts,
 		cb: (err: Error | null, s?: Duplex) => void
 	) {
-		const connectOpts = {
-			...options,
-			secureEndpoint: this.isSecureEndpoint(options),
-		};
+		const secureEndpoint = this.isSecureEndpoint(options);
+		// Optimized: avoid object spread when possible
+		const connectOpts =
+			(options as any).secureEndpoint === secureEndpoint
+				? options
+				: { ...options, secureEndpoint };
 		const name = this.getName(connectOpts);
 		const fakeSocket = this.incrementSockets(name);
-		Promise.resolve()
-			.then(() => this.connect(req, connectOpts))
-			.then(
-				(socket) => {
-					this.decrementSockets(name, fakeSocket);
-					if (socket instanceof http.Agent) {
-						try {
-							// @ts-expect-error `addRequest()` isn't defined in `@types/node`
-							return socket.addRequest(req, connectOpts);
-						} catch (err: unknown) {
-							return cb(err as Error);
-						}
-					}
-					this[INTERNAL].currentSocket = socket;
-					// @ts-expect-error `createSocket()` isn't defined in `@types/node`
-					super.createSocket(req, options, cb);
-				},
-				(err) => {
-					this.decrementSockets(name, fakeSocket);
-					cb(err);
+
+		// Optimized: avoid unnecessary Promise.resolve() wrapper
+		const connectResult = this.connect(req, connectOpts);
+
+		// Fast path: if connect returns synchronously, handle directly
+		if (connectResult && typeof (connectResult as any).then !== 'function') {
+			this.decrementSockets(name, fakeSocket);
+			if (connectResult instanceof http.Agent) {
+				try {
+					// @ts-expect-error `addRequest()` isn't defined in `@types/node`
+					return connectResult.addRequest(req, connectOpts);
+				} catch (err: unknown) {
+					return cb(err as Error);
 				}
-			);
+			}
+			this[INTERNAL].currentSocket = connectResult as Duplex;
+			// @ts-expect-error `createSocket()` isn't defined in `@types/node`
+			return super.createSocket(req, options, cb);
+		}
+
+		// Async path
+		Promise.resolve(connectResult).then(
+			(socket) => {
+				this.decrementSockets(name, fakeSocket);
+				if (socket instanceof http.Agent) {
+					try {
+						// @ts-expect-error `addRequest()` isn't defined in `@types/node`
+						return socket.addRequest(req, connectOpts);
+					} catch (err: unknown) {
+						return cb(err as Error);
+					}
+				}
+				this[INTERNAL].currentSocket = socket;
+				// @ts-expect-error `createSocket()` isn't defined in `@types/node`
+				super.createSocket(req, options, cb);
+			},
+			(err) => {
+				this.decrementSockets(name, fakeSocket);
+				cb(err);
+			}
+		);
 	}
 
 	createConnection(): Duplex {
