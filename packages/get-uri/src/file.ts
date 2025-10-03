@@ -39,23 +39,37 @@ export const file: GetUriProtocol<FileOptions> = async (
 		const filepath = fileURLToPath(uri);
 		debug('Normalized pathname: %o', filepath);
 
-		// `open()` first to get a file descriptor and ensure that the file
-		// exists.
-		const fdHandle = await fsPromises.open(filepath, flags, mode);
-		// extract the numeric file descriptor
-		const fd = fdHandle.fd;
+		// Fast path: if no cache, skip stat check and open file directly
+		if (!cache || !cache.stat) {
+			// Open file and get fd
+			const fdHandle = await fsPromises.open(filepath, flags, mode);
+			const fd = fdHandle.fd;
 
-		// store the stat object for the cache.
+			// Get stat for future cache use
+			const stat = await fdHandle.stat();
+
+			// Create read stream - fd is closed by autoClose
+			const rs = createReadStream(filepath, {
+				autoClose: true,
+				...opts,
+				fd,
+			}) as FileReadable;
+			rs.stat = stat;
+			return rs;
+		}
+
+		// Cache validation path
+		const fdHandle = await fsPromises.open(filepath, flags, mode);
+		const fd = fdHandle.fd;
 		const stat = await fdHandle.stat();
 
-		// if a `cache` was provided, check if the file has not been modified
-		if (cache && cache.stat && stat && isNotModified(cache.stat, stat)) {
+		// Check if file has not been modified
+		if (isNotModified(cache.stat, stat)) {
 			await fdHandle.close();
 			throw new NotModifiedError();
 		}
 
-		// `fs.ReadStream` takes care of calling `fs.close()` on the
-		// fd after it's done reading
+		// File was modified, return new stream
 		const rs = createReadStream(filepath, {
 			autoClose: true,
 			...opts,

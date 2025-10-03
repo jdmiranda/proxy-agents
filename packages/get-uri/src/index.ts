@@ -37,6 +37,19 @@ export type ProtocolOpts<T> = {
 
 const VALID_PROTOCOLS = new Set(Object.keys(protocols));
 
+// Protocol handler cache - Map for O(1) lookup
+const protocolHandlerCache = new Map<string, GetUriProtocol<any>>([
+	['data', data],
+	['file', file],
+	['ftp', ftp],
+	['http', http],
+	['https', https],
+]);
+
+// URL parsing cache - LRU cache for parsed URLs (limit to 1000 entries)
+const urlParseCache = new Map<string, URL>();
+const URL_CACHE_MAX_SIZE = 1000;
+
 export function isValidProtocol(p: string): p is keyof Protocols {
 	return VALID_PROTOCOLS.has(p);
 }
@@ -66,16 +79,46 @@ export async function getUri<Uri extends string>(
 		throw new TypeError('Must pass in a URI to "getUri()"');
 	}
 
-	const url = typeof uri === 'string' ? new URL(uri) : uri;
+	// Fast path: if already a URL object, use it directly
+	let url: URL;
+	if (typeof uri === 'string') {
+		// Check if we have a cached parsed URL for this string
+		const cached = urlParseCache.get(uri);
+		if (cached) {
+			url = cached;
+		} else {
+			url = new URL(uri);
+			// Cache the parsed URL with LRU eviction
+			if (urlParseCache.size >= URL_CACHE_MAX_SIZE) {
+				// Remove oldest entry (first key in Map)
+				const firstKey = urlParseCache.keys().next().value;
+				if (firstKey) {
+					urlParseCache.delete(firstKey);
+				}
+			}
+			urlParseCache.set(uri, url);
+		}
+	} else {
+		url = uri;
+	}
 
-	// Strip trailing `:`
-	const protocol = url.protocol.replace(/:$/, '');
+	// Strip trailing `:` - use slice for better performance than replace
+	const protocol = url.protocol.endsWith(':')
+		? url.protocol.slice(0, -1)
+		: url.protocol;
+
 	if (!isValidProtocol(protocol)) {
 		throw new TypeError(
 			`Unsupported protocol "${protocol}" specified in URI: "${uri}"`
 		);
 	}
 
-	const getter = protocols[protocol];
+	// Fast path: use Map cache for O(1) lookup
+	const getter = protocolHandlerCache.get(protocol);
+	if (!getter) {
+		// Fallback to original method (should not happen for valid protocols)
+		return protocols[protocol](url, opts as never);
+	}
+
 	return getter(url, opts as never);
 }
