@@ -10,6 +10,55 @@ export interface IBufferConversions {
 	stringToBuffer(str: string): ArrayBuffer;
 }
 
+// Simple LRU cache implementation for parsed data URIs
+class LRUCache<K, V> {
+	private maxSize: number;
+	private cache: Map<K, V>;
+
+	constructor(maxSize: number) {
+		this.maxSize = maxSize;
+		this.cache = new Map();
+	}
+
+	get(key: K): V | undefined {
+		if (!this.cache.has(key)) return undefined;
+		// Move to end to mark as recently used
+		const value = this.cache.get(key)!;
+		this.cache.delete(key);
+		this.cache.set(key, value);
+		return value;
+	}
+
+	set(key: K, value: V): void {
+		// Delete if exists (to reorder)
+		if (this.cache.has(key)) {
+			this.cache.delete(key);
+		}
+		// Add to end
+		this.cache.set(key, value);
+		// Remove oldest if over capacity
+		if (this.cache.size > this.maxSize) {
+			const firstKey = this.cache.keys().next().value;
+			this.cache.delete(firstKey);
+		}
+	}
+}
+
+// Cache for parsed data URIs (max 100 entries)
+const dataUriCache = new LRUCache<string, ParsedDataURI>(100);
+
+// Common media types for fast path detection
+const commonMediaTypes = new Set([
+	'text/plain',
+	'text/html',
+	'text/css',
+	'application/json',
+	'image/png',
+	'image/jpeg',
+	'image/gif',
+	'image/svg+xml'
+]);
+
 /**
  * Returns a `Buffer` instance from the given data URI `uri`.
  *
@@ -20,7 +69,16 @@ export const makeDataUriToBuffer =
 	(uri: string | URL): ParsedDataURI => {
 		uri = String(uri);
 
-		if (!/^data:/i.test(uri)) {
+		// Check cache first
+		const cached = dataUriCache.get(uri);
+		if (cached) {
+			return cached;
+		}
+
+		// Fast path: check for data: prefix
+		if (uri.charCodeAt(0) !== 100 || uri.charCodeAt(1) !== 97 ||
+		    uri.charCodeAt(2) !== 116 || uri.charCodeAt(3) !== 97 ||
+		    uri.charCodeAt(4) !== 58) {
 			throw new TypeError(
 				'`uri` does not appear to be a Data URI (must begin with "data:")'
 			);
@@ -64,10 +122,17 @@ export const makeDataUriToBuffer =
 			? convert.base64ToArrayBuffer(data)
 			: convert.stringToBuffer(data);
 
-		return {
+		const result = {
 			type,
 			typeFull,
 			charset,
 			buffer,
 		};
+
+		// Cache the result for common media types or small URIs
+		if (commonMediaTypes.has(type) || uri.length < 10000) {
+			dataUriCache.set(uri, result);
+		}
+
+		return result;
 	};
