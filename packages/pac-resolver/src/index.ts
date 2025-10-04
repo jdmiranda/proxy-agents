@@ -18,6 +18,25 @@ import timeRange from './timeRange';
 import weekdayRange from './weekdayRange';
 import type { QuickJSWASMModule } from '@tootallnate/quickjs-emscripten';
 
+// Script compilation cache
+interface CompiledResolverCacheEntry {
+	resolver: (url: string, host: string) => Promise<string>;
+	timestamp: number;
+}
+
+const COMPILED_RESOLVER_CACHE = new Map<string, CompiledResolverCacheEntry>();
+const SCRIPT_CACHE_TTL = 3600000; // 1 hour in milliseconds
+
+// FindProxyForURL result memoization cache
+interface ProxyResultCacheEntry {
+	result: string;
+	timestamp: number;
+}
+
+const PROXY_RESULT_CACHE = new Map<string, ProxyResultCacheEntry>();
+const RESULT_CACHE_TTL = 300000; // 5 minutes in milliseconds
+const MAX_CACHE_SIZE = 10000;
+
 /**
  * Returns an asynchronous `FindProxyForURL()` function
  * from the given JS string (from a PAC file).
@@ -47,13 +66,53 @@ export function createPacResolver(
 		sandbox: context,
 	};
 
-	// Compile the JS `FindProxyForURL()` function into an async function.
-	const resolver = compile<string, [url: string, host: string]>(
-		qjs,
-		str,
-		'FindProxyForURL',
-		opts
-	);
+	// Only cache if using default sandbox (to avoid circular reference issues)
+	const hasCustomSandbox = _opts.sandbox && Object.keys(_opts.sandbox).length > 0;
+	const cacheKey = str;
+	const now = Date.now();
+
+	let resolver: (url: string, host: string) => Promise<string>;
+
+	// Check if we have a cached compiled resolver (only if no custom sandbox)
+	if (!hasCustomSandbox) {
+		const cached = COMPILED_RESOLVER_CACHE.get(cacheKey);
+		if (cached && (now - cached.timestamp) < SCRIPT_CACHE_TTL) {
+			resolver = cached.resolver;
+		} else {
+			// Compile the JS `FindProxyForURL()` function into an async function.
+			resolver = compile<string, [url: string, host: string]>(
+				qjs,
+				str,
+				'FindProxyForURL',
+				opts
+			);
+
+			// Cache the compiled resolver
+			COMPILED_RESOLVER_CACHE.set(cacheKey, {
+				resolver,
+				timestamp: now
+			});
+
+			// Cleanup old compiled resolver cache entries
+			if (COMPILED_RESOLVER_CACHE.size > 100) {
+				const entriesToDelete: string[] = [];
+				for (const [key, entry] of COMPILED_RESOLVER_CACHE.entries()) {
+					if ((now - entry.timestamp) >= SCRIPT_CACHE_TTL) {
+						entriesToDelete.push(key);
+					}
+				}
+				entriesToDelete.forEach(key => COMPILED_RESOLVER_CACHE.delete(key));
+			}
+		}
+	} else {
+		// Don't cache when custom sandbox is provided
+		resolver = compile<string, [url: string, host: string]>(
+			qjs,
+			str,
+			'FindProxyForURL',
+			opts
+		);
+	}
 
 	function FindProxyForURL(
 		url: string | URL,
@@ -66,7 +125,52 @@ export function createPacResolver(
 			throw new TypeError('Could not determine `host`');
 		}
 
-		return resolver(urlObj.href, host);
+		const urlHref = urlObj.href;
+		const resultCacheKey = `${urlHref}:${host}`;
+		const now = Date.now();
+
+		// Check result cache
+		const cachedResult = PROXY_RESULT_CACHE.get(resultCacheKey);
+		if (cachedResult && (now - cachedResult.timestamp) < RESULT_CACHE_TTL) {
+			return Promise.resolve(cachedResult.result);
+		}
+
+		// Execute resolver and cache result
+		return resolver(urlHref, host).then(result => {
+			PROXY_RESULT_CACHE.set(resultCacheKey, {
+				result,
+				timestamp: now
+			});
+
+			// Cleanup old result cache entries when it gets too large
+			if (PROXY_RESULT_CACHE.size > MAX_CACHE_SIZE) {
+				const entriesToDelete: string[] = [];
+				let deletedCount = 0;
+				const maxToDelete = Math.floor(MAX_CACHE_SIZE * 0.2); // Delete 20% of cache
+
+				for (const [key, entry] of PROXY_RESULT_CACHE.entries()) {
+					if ((now - entry.timestamp) >= RESULT_CACHE_TTL) {
+						entriesToDelete.push(key);
+						deletedCount++;
+						if (deletedCount >= maxToDelete) break;
+					}
+				}
+
+				// If not enough old entries, delete oldest entries
+				if (deletedCount < maxToDelete) {
+					const sortedEntries = Array.from(PROXY_RESULT_CACHE.entries())
+						.sort((a, b) => a[1].timestamp - b[1].timestamp);
+
+					for (let i = 0; i < maxToDelete - deletedCount && i < sortedEntries.length; i++) {
+						entriesToDelete.push(sortedEntries[i][0]);
+					}
+				}
+
+				entriesToDelete.forEach(key => PROXY_RESULT_CACHE.delete(key));
+			}
+
+			return result;
+		});
 	}
 
 	Object.defineProperty(FindProxyForURL, 'toString', {
