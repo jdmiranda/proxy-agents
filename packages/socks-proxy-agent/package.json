@@ -138,5 +138,13 @@
     "lint": "eslint . --ext .ts",
     "pack": "node ../../scripts/pack.mjs"
   },
-  "license": "MIT"
+  "license": "MIT",
+  "sideEffects": false,
+  "exports": {
+    "./package.json": "./package.json",
+    ".": {
+      "default": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    }
+  }
 }
