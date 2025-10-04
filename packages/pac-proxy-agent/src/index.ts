@@ -24,6 +24,46 @@ import { getQuickJS } from '@tootallnate/quickjs-emscripten';
 
 const debug = createDebug('pac-proxy-agent');
 
+// Global caches for optimization
+interface CachedPacFile {
+	code: string;
+	hash: string;
+	timestamp: number;
+}
+
+interface CachedResolution {
+	result: string;
+	timestamp: number;
+}
+
+const pacFileCache = new Map<string, CachedPacFile>();
+const resolutionCache = new Map<string, CachedResolution>();
+const CACHE_TTL = 60000; // 1 minute TTL for resolution cache
+const PAC_FILE_CACHE_TTL = 300000; // 5 minutes TTL for PAC file cache
+
+/**
+ * Clear all caches (useful for testing)
+ */
+export function clearPacCaches(): void {
+	pacFileCache.clear();
+	resolutionCache.clear();
+}
+
+/**
+ * Get cache statistics (useful for monitoring)
+ */
+export function getCacheStats() {
+	return {
+		pacFileCache: {
+			size: pacFileCache.size,
+			entries: Array.from(pacFileCache.keys()),
+		},
+		resolutionCache: {
+			size: resolutionCache.size,
+		},
+	};
+}
+
 const setServernameFromNonIpHost = <
 	T extends { host?: string; servername?: string }
 >(
@@ -178,6 +218,16 @@ export class PacProxyAgent<Uri extends string> extends Agent {
 	private async loadPacFile(): Promise<string> {
 		debug('Loading PAC file: %o', this.uri);
 
+		const cacheKey = this.uri.href;
+		const now = Date.now();
+
+		// Check PAC file cache
+		const cached = pacFileCache.get(cacheKey);
+		if (cached && (now - cached.timestamp) < PAC_FILE_CACHE_TTL) {
+			debug('Using cached PAC file for URI: %o', this.uri.href);
+			return cached.code;
+		}
+
 		const rs = await getUri(this.uri, { ...this.opts, cache: this.cache });
 		debug('Got `Readable` instance for URI');
 		this.cache = rs;
@@ -185,7 +235,14 @@ export class PacProxyAgent<Uri extends string> extends Agent {
 		const buf = await toBuffer(rs);
 		debug('Read %o byte PAC file from URI', buf.length);
 
-		return buf.toString('utf8');
+		const code = buf.toString('utf8');
+
+		// Cache the PAC file content
+		const hash = crypto.createHash('sha1').update(code).digest('hex');
+		pacFileCache.set(cacheKey, { code, hash, timestamp: now });
+		debug('Cached PAC file for URI: %o', this.uri.href);
+
+		return code;
 	}
 
 	/**
@@ -213,7 +270,25 @@ export class PacProxyAgent<Uri extends string> extends Agent {
 		);
 
 		debug('url: %s', url);
-		let result = await resolver(url);
+
+		// Check resolution cache with memoization
+		const cacheKey = `${this.uri.href}::${url.href}`;
+		const now = Date.now();
+		const cachedResolution = resolutionCache.get(cacheKey);
+
+		let result: string;
+		if (cachedResolution && (now - cachedResolution.timestamp) < CACHE_TTL) {
+			debug('Using cached resolution for URL: %s', url.href);
+			result = cachedResolution.result;
+		} else {
+			result = await resolver(url);
+
+			// Cache the resolution result
+			if (result) {
+				resolutionCache.set(cacheKey, { result, timestamp: now });
+				debug('Cached resolution result for URL: %s', url.href);
+			}
+		}
 
 		// Default to "DIRECT" if a falsey value was returned (or nothing)
 		if (!result) {
