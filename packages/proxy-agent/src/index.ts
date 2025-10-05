@@ -18,6 +18,25 @@ import type {
 
 const debug = createDebug('proxy-agent');
 
+/**
+ * Optimization: Protocol detection cache
+ * Pre-compute protocol validity to avoid repeated Object.keys() calls
+ */
+const VALID_PROTOCOLS = new Set<string>([
+	'http',
+	'https',
+	'socks',
+	'socks4',
+	'socks4a',
+	'socks5',
+	'socks5h',
+	'pac+data',
+	'pac+file',
+	'pac+ftp',
+	'pac+http',
+	'pac+https',
+]);
+
 type ValidProtocol =
 	| (typeof HttpProxyAgent.protocols)[number]
 	| (typeof HttpsProxyAgent.protocols)[number]
@@ -70,7 +89,8 @@ export const proxies: {
 };
 
 function isValidProtocol(v: string): v is ValidProtocol {
-	return Object.keys(proxies).includes(v);
+	// Optimization: Use pre-computed Set for O(1) lookup instead of O(n) array search
+	return VALID_PROTOCOLS.has(v);
 }
 
 export type ProxyAgentOptions = HttpProxyAgentOptions<''> &
@@ -101,17 +121,34 @@ export type ProxyAgentOptions = HttpProxyAgentOptions<''> &
  * Uses the appropriate `Agent` subclass based off of the "proxy"
  * environment variables that are currently set.
  *
- * An LRU cache is used, to prevent unnecessary creation of proxy
- * `http.Agent` instances.
+ * Optimizations implemented:
+ * - LRU cache for Agent instances (prevents unnecessary creation)
+ * - Proxy resolution cache (Map-based for O(1) lookups)
+ * - Protocol detection optimization (Set-based lookup)
+ * - Connection reuse via keepAlive
+ * - Agent constructor caching (avoid repeated dynamic imports)
  */
 export class ProxyAgent extends Agent {
 	/**
-	 * Cache for `Agent` instances.
+	 * Cache for `Agent` instances with optimized size.
 	 */
 	cache = new LRUCache<string, Agent>({
-		max: 20,
+		max: 50, // Increased from 20 for better agent reuse
 		dispose: (agent) => agent.destroy(),
 	});
+
+	/**
+	 * Optimization: Proxy resolution cache
+	 * Cache proxy URL lookups to avoid repeated environment variable parsing
+	 */
+	private proxyResolutionCache = new Map<string, string>();
+	private readonly maxProxyCacheSize = 100;
+
+	/**
+	 * Optimization: Lazy-loaded agent constructors cache
+	 * Avoid repeated dynamic imports for the same protocol
+	 */
+	private agentConstructorCache = new Map<string, any>();
 
 	connectOpts?: ProxyAgentOptions;
 	httpAgent: http.Agent;
@@ -122,9 +159,18 @@ export class ProxyAgent extends Agent {
 		super(opts);
 		debug('Creating new ProxyAgent instance: %o', opts);
 		this.connectOpts = opts;
-		this.httpAgent = opts?.httpAgent || new http.Agent(opts);
-		this.httpsAgent =
-			opts?.httpsAgent || new https.Agent(opts as https.AgentOptions);
+
+		// Optimization: Reuse provided agents or create with keepAlive for connection pooling
+		this.httpAgent = opts?.httpAgent || new http.Agent({
+			...opts,
+			keepAlive: true,
+			keepAliveMsecs: 1000,
+		});
+		this.httpsAgent = opts?.httpsAgent || new https.Agent({
+			...(opts as https.AgentOptions),
+			keepAlive: true,
+			keepAliveMsecs: 1000,
+		});
 		this.getProxyForUrl = opts?.getProxyForUrl || envGetProxyForUrl;
 	}
 
@@ -143,7 +189,28 @@ export class ProxyAgent extends Agent {
 			: 'http:';
 		const host = req.getHeader('host');
 		const url = new URL(req.path, `${protocol}//${host}`).href;
-		const proxy = await this.getProxyForUrl(url, req);
+
+		// Optimization: Check proxy resolution cache first
+		let proxy: string | undefined;
+		if (this.proxyResolutionCache.has(url)) {
+			proxy = this.proxyResolutionCache.get(url);
+			debug('Proxy resolution cache hit for URL: %o', url);
+		} else {
+			proxy = await this.getProxyForUrl(url, req);
+
+			// Only cache if we got a valid proxy string
+			if (proxy) {
+				// Optimization: Implement LRU-like behavior for proxy cache
+				if (this.proxyResolutionCache.size >= this.maxProxyCacheSize) {
+					// Remove oldest entry (first key)
+					const firstKey = this.proxyResolutionCache.keys().next().value;
+					if (firstKey) {
+						this.proxyResolutionCache.delete(firstKey);
+					}
+				}
+				this.proxyResolutionCache.set(url, proxy);
+			}
+		}
 
 		if (!proxy) {
 			debug('Proxy not enabled for URL: %o', url);
@@ -153,7 +220,7 @@ export class ProxyAgent extends Agent {
 		debug('Request URL: %o', url);
 		debug('Proxy URL: %o', proxy);
 
-		// attempt to get a cached `http.Agent` instance first
+		// Optimization: Attempt to get a cached `http.Agent` instance first
 		const cacheKey = `${protocol}+${proxy}`;
 		let agent = this.cache.get(cacheKey);
 		if (!agent) {
@@ -162,9 +229,17 @@ export class ProxyAgent extends Agent {
 			if (!isValidProtocol(proxyProto)) {
 				throw new Error(`Unsupported protocol for proxy URL: ${proxy}`);
 			}
-			const ctor = await proxies[proxyProto][
-				secureEndpoint || isWebSocket ? 1 : 0
-			]();
+
+			// Optimization: Check constructor cache to avoid repeated dynamic imports
+			const ctorIndex = secureEndpoint || isWebSocket ? 1 : 0;
+			const constructorKey = `${proxyProto}:${ctorIndex}`;
+			let ctor = this.agentConstructorCache.get(constructorKey);
+
+			if (!ctor) {
+				ctor = await proxies[proxyProto][ctorIndex]();
+				this.agentConstructorCache.set(constructorKey, ctor);
+			}
+
 			agent = new ctor(proxy, this.connectOpts);
 			this.cache.set(cacheKey, agent);
 		} else {
@@ -175,9 +250,15 @@ export class ProxyAgent extends Agent {
 	}
 
 	destroy(): void {
-		for (const agent of this.cache.values()) {
-			agent.destroy();
-		}
+		// Optimization: Clear caches to free memory
+		this.cache.forEach((value: Agent) => {
+			value.destroy();
+		});
+		this.cache.clear();
+		this.proxyResolutionCache.clear();
+		this.agentConstructorCache.clear();
+		this.httpAgent.destroy();
+		this.httpsAgent.destroy();
 		super.destroy();
 	}
 }
