@@ -54,5 +54,13 @@
   },
   "engines": {
     "node": ">= 14"
+  },
+  "sideEffects": false,
+  "exports": {
+    "./package.json": "./package.json",
+    ".": {
+      "default": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    }
   }
 }
