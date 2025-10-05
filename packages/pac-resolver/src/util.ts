@@ -9,6 +9,7 @@ interface DNSCacheEntry {
 
 const DNS_CACHE = new Map<string, DNSCacheEntry>();
 const DNS_CACHE_TTL = 300000; // 5 minutes in milliseconds
+const MAX_DNS_CACHE_SIZE = 1000;
 
 export function dnsLookup(
 	host: string,
@@ -20,6 +21,9 @@ export function dnsLookup(
 	// Check cache
 	const cached = DNS_CACHE.get(cacheKey);
 	if (cached && (now - cached.timestamp) < DNS_CACHE_TTL) {
+		// touch entry to preserve recency
+		DNS_CACHE.delete(cacheKey);
+		DNS_CACHE.set(cacheKey, cached);
 		return Promise.resolve(cached.result);
 	}
 
@@ -29,13 +33,18 @@ export function dnsLookup(
 				reject(err);
 			} else {
 				// Store in cache
+				// Bound cache and set entry (touch if exists)
+				if (DNS_CACHE.size >= MAX_DNS_CACHE_SIZE) {
+					const firstKey = DNS_CACHE.keys().next().value;
+					DNS_CACHE.delete(firstKey);
+				}
 				DNS_CACHE.set(cacheKey, {
 					result: res,
 					timestamp: now
 				});
 
 				// Cleanup old entries periodically (simple strategy)
-				if (DNS_CACHE.size > 1000) {
+				if (DNS_CACHE.size > MAX_DNS_CACHE_SIZE) {
 					const entriesToDelete: string[] = [];
 					for (const [key, entry] of DNS_CACHE.entries()) {
 						if ((now - entry.timestamp) >= DNS_CACHE_TTL) {
