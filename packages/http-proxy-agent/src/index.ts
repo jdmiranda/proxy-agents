@@ -112,7 +112,11 @@ export class HttpProxyAgent<Uri extends string> extends Agent {
 		// Use cached URL parsing for better performance
 		const cacheKey = `${base}${req.path}${opts.port}`;
 		let url = urlCache.get(cacheKey);
-		if (!url) {
+		if (url) {
+			// touch entry to preserve recency
+			urlCache.delete(cacheKey);
+			urlCache.set(cacheKey, url);
+		} else {
 			url = new URL(req.path, base);
 			if (opts.port !== 80) {
 				url.port = String(opts.port);

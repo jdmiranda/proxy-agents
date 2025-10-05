@@ -52,5 +52,13 @@
   },
   "engines": {
     "node": ">= 14"
+  },
+  "sideEffects": false,
+  "exports": {
+    "./package.json": "./package.json",
+    ".": {
+      "default": "./dist/proxy.js",
+      "types": "./dist/proxy.d.ts"
+    }
   }
 }
